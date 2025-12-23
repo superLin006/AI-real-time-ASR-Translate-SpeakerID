@@ -1,12 +1,8 @@
 package com.k2fsa.sherpa.onnx.simulate.streaming.asr.screens
 
 import android.Manifest
-import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.pm.PackageManager
-import android.media.AudioFormat
-import android.media.AudioRecord
-import android.media.MediaRecorder
 import android.util.Log
 import android.widget.Toast
 import androidx.compose.foundation.layout.*
@@ -26,23 +22,23 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.app.ActivityCompat
+import com.k2fsa.sherpa.onnx.config.ModelConfig
+import com.k2fsa.sherpa.onnx.pipeline.AudioRecorder
+import com.k2fsa.sherpa.onnx.pipeline.SpeechPipeline
 import com.k2fsa.sherpa.onnx.simulate.streaming.asr.R
-import com.k2fsa.sherpa.onnx.simulate.streaming.asr.SimulateStreamingAsr
 import com.k2fsa.sherpa.onnx.simulate.streaming.asr.TAG
 import kotlinx.coroutines.*
-import kotlinx.coroutines.channels.Channel
 import kotlin.math.absoluteValue
 
-private var audioRecord: AudioRecord? = null
-private const val sampleRateInHz = 16000
-private var samplesChannel = Channel<FloatArray>(capacity = Channel.UNLIMITED)
+private var audioRecorder: AudioRecorder? = null
+private var speechPipeline: SpeechPipeline? = null
 
 // 带时间戳、说话人标签和翻译的结果数据类
 data class SpeakerResult(
-    val timestamp: String,          // 新增：时间戳
+    val timestamp: String,
     val speakerName: String,
     val originalText: String,
-    val translatedText: String?,    // null 表示还没翻译，空字符串也保留
+    val translatedText: String?,
     val isFinal: Boolean = true
 )
 
@@ -57,324 +53,101 @@ fun HomeScreen() {
     val lazyColumnListState = rememberLazyListState()
     val coroutineScope = rememberCoroutineScope()
     
-    // 录音开始时间（用于计算时间戳）
-    val recordingStartTime = remember { mutableStateOf(0L) }
+    // Pipeline 结果回调
+    val onIntermediateResult: (com.k2fsa.sherpa.onnx.pipeline.PipelineResult) -> Unit = { result ->
+        coroutineScope.launch(Dispatchers.Main) {
+            val displayResult = SpeakerResult(
+                timestamp = result.timestamp,
+                speakerName = result.speakerName,
+                originalText = result.originalText,
+                translatedText = result.translatedText,
+                isFinal = result.isFinal
+            )
+            
+            // 🔥 与原代码逻辑完全一致
+            if (resultList.isEmpty() || resultList.last().isFinal) {
+                // 没有中间结果或上一个已经是最终结果，添加新的
+                resultList.add(displayResult)
+            } else {
+                // 更新最后一个中间结果
+                resultList[resultList.lastIndex] = displayResult
+            }
+            
+            lazyColumnListState.animateScrollToItem(resultList.size - 1)
+        }
+    }
     
-    // 翻译管理
-    val translationJobs = remember { mutableMapOf<Int, Job>() }
-    val translationCache = remember { mutableMapOf<String, String>() }
+    val onFinalResult: (com.k2fsa.sherpa.onnx.pipeline.PipelineResult) -> Unit = { result ->
+        coroutineScope.launch(Dispatchers.Main) {
+            val displayResult = SpeakerResult(
+                timestamp = result.timestamp,
+                speakerName = result.speakerName,
+                originalText = result.originalText,
+                translatedText = result.translatedText,
+                isFinal = result.isFinal
+            )
+            
+            // 🔥 与原代码逻辑完全一致
+            if (resultList.isEmpty() || resultList.last().isFinal) {
+                // 直接添加（没有中间结果的情况）
+                resultList.add(displayResult)
+            } else {
+                // 更新最后一个中间结果为最终结果
+                resultList[resultList.lastIndex] = displayResult
+            }
+            
+            lazyColumnListState.animateScrollToItem(resultList.size - 1)
+        }
+    }
     
-    // 防抖动：最小翻译间隔（毫秒）
-    val minTranslationInterval = 500L
-    val lastTranslationTime = remember { mutableStateOf(0L) }
-
+    val onTranslationUpdate: (Int, String) -> Unit = { resultIndex, translation ->
+        coroutineScope.launch(Dispatchers.Main) {
+            // 🔥 与原代码逻辑完全一致：直接更新指定索引的翻译
+            if (resultIndex >= 0 && resultIndex < resultList.size) {
+                resultList[resultIndex] = resultList[resultIndex].copy(
+                    translatedText = translation
+                )
+            }
+        }
+    }
+    
     val onRecordingButtonClick: () -> Unit = {
         isStarted = !isStarted
+        
         if (isStarted) {
-            if (ActivityCompat.checkSelfPermission(
-                    activity,
-                    Manifest.permission.RECORD_AUDIO
-                ) != PackageManager.PERMISSION_GRANTED
-            ) {
+            if (ActivityCompat.checkSelfPermission(activity, Manifest.permission.RECORD_AUDIO) 
+                != PackageManager.PERMISSION_GRANTED) {
                 Log.i(TAG, "Recording is not allowed")
-            } else {
-                // 🕐 记录录音开始时间
-                recordingStartTime.value = System.currentTimeMillis()
-                
-                // 录音配置
-                val audioSource = MediaRecorder.AudioSource.MIC
-                val channelConfig = AudioFormat.CHANNEL_IN_MONO
-                val audioFormat = AudioFormat.ENCODING_PCM_16BIT
-                val numBytes = AudioRecord.getMinBufferSize(sampleRateInHz, channelConfig, audioFormat)
-                audioRecord = AudioRecord(
-                    audioSource,
-                    sampleRateInHz,
-                    AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                    numBytes * 2
-                )
-
-                SimulateStreamingAsr.vad.reset()
-
-                // 音频采集协程
-                CoroutineScope(Dispatchers.IO).launch {
-                    Log.i(TAG, "processing samples")
-                    val interval = 0.1
-                    val bufferSize = (interval * sampleRateInHz).toInt()
-                    val buffer = ShortArray(bufferSize)
-
-                    audioRecord?.let { it ->
-                        it.startRecording()
-
-                        while (isStarted) {
-                            val ret = audioRecord?.read(buffer, 0, buffer.size)
-                            ret?.let { n ->
-                                val samples = FloatArray(n) { buffer[it] / 32768.0f }
-                                samplesChannel.send(samples)
-                            }
-                        }
-                        val samples = FloatArray(0)
-                        samplesChannel.send(samples)
-                    }
-                }
-
-                // VAD + ASR + 说话人识别 + 翻译处理协程
-                CoroutineScope(Dispatchers.Default).launch {
-                    var buffer = arrayListOf<Float>()
-                    var offset = 0
-                    val windowSize = 512
-                    var isSpeechStarted = false
-                    var speechStartTime = 0L  // 语音段开始时间
-                    var startTime = System.currentTimeMillis()
-                    var lastText = ""
-                    var added = false
-                    var currentIndex = -1
-
-                    while (isStarted) {
-                        for (s in samplesChannel) {
-                            if (s.isEmpty()) {
-                                break
-                            }
-
-                            buffer.addAll(s.toList())
-                            
-                            // VAD 处理
-                            while (offset + windowSize < buffer.size) {
-                                SimulateStreamingAsr.vad.acceptWaveform(
-                                    buffer.subList(offset, offset + windowSize).toFloatArray()
-                                )
-                                offset += windowSize
-                                
-                                if (!isSpeechStarted && SimulateStreamingAsr.vad.isSpeechDetected()) {
-                                    isSpeechStarted = true
-                                    startTime = System.currentTimeMillis()
-                                    // 🕐 记录语音段开始时间（相对于录音开始）
-                                    speechStartTime = System.currentTimeMillis()
-                                }
-                            }
-
-                            // 实时 ASR（中间结果）
-                            val elapsed = System.currentTimeMillis() - startTime
-                            if (isSpeechStarted && elapsed > 200) {
-                                val stream = SimulateStreamingAsr.recognizer.createStream()
-                                stream.acceptWaveform(
-                                    buffer.subList(0, offset).toFloatArray(),
-                                    sampleRateInHz
-                                )
-                                SimulateStreamingAsr.recognizer.decode(stream)
-                                val result = SimulateStreamingAsr.recognizer.getResult(stream)
-                                stream.release()
-
-                                lastText = result.text
-
-                                if (lastText.isNotBlank()) {
-                                    // 🕐 计算时间戳
-                                    val timestamp = formatTimestamp(speechStartTime - recordingStartTime.value)
-                                    
-                                    // 创建或更新中间结果
-                                    val tempResult = SpeakerResult(
-                                        timestamp = timestamp,
-                                        speakerName = "...",
-                                        originalText = lastText,
-                                        translatedText = null,  // ✅ 不显示"翻译中"，保持 null
-                                        isFinal = false
-                                    )
-                                    
-                                    if (!added || resultList.isEmpty()) {
-                                        resultList.add(tempResult)
-                                        currentIndex = resultList.size - 1
-                                        added = true
-                                    } else {
-                                        // ✅ 保留之前的翻译（如果有）
-                                        val oldTranslation = if (currentIndex >= 0 && currentIndex < resultList.size) {
-                                            resultList[currentIndex].translatedText
-                                        } else null
-                                        
-                                        resultList[currentIndex] = tempResult.copy(
-                                            translatedText = oldTranslation  // 保留旧译文
-                                        )
-                                    }
-
-                                    coroutineScope.launch {
-                                        lazyColumnListState.animateScrollToItem(resultList.size - 1)
-                                    }
-                                    
-                                    // 🔥 实时翻译中间结果
-                                    val now = System.currentTimeMillis()
-                                    if (SimulateStreamingAsr.isTranslatorReady() && 
-                                        (now - lastTranslationTime.value) > minTranslationInterval) {
-                                        
-                                        lastTranslationTime.value = now
-                                        
-                                        // 取消之前的翻译任务
-                                        translationJobs[currentIndex]?.cancel()
-                                        
-                                        // 启动新的翻译任务
-                                        val job = CoroutineScope(Dispatchers.IO).launch {
-                                            try {
-                                                // 检查缓存
-                                                val cachedTranslation = translationCache[lastText]
-                                                val translation = if (cachedTranslation != null) {
-                                                    Log.d(TAG, "Using cached translation for: $lastText")
-                                                    cachedTranslation
-                                                } else {
-                                                    Log.d(TAG, "Translating intermediate: $lastText")
-                                                    val trans = SimulateStreamingAsr.translateText(lastText)
-                                                    if (trans != null && trans.isNotEmpty()) {
-                                                        translationCache[lastText] = trans
-                                                        trans
-                                                    } else null
-                                                }
-                                                
-                                                // ✅ 直接更新翻译结果，不显示"翻译中"状态
-                                                if (translation != null && currentIndex >= 0 && currentIndex < resultList.size) {
-                                                    resultList[currentIndex] = resultList[currentIndex].copy(
-                                                        translatedText = translation
-                                                    )
-                                                }
-                                            } catch (e: CancellationException) {
-                                                Log.d(TAG, "Translation cancelled")
-                                            } catch (e: Exception) {
-                                                Log.e(TAG, "Translation error: ${e.message}")
-                                            }
-                                        }
-                                        translationJobs[currentIndex] = job
-                                    }
-                                }
-
-                                startTime = System.currentTimeMillis()
-                            }
-
-                            // 处理完整的语音段（VAD 检测到结束）
-                            while (!SimulateStreamingAsr.vad.empty()) {
-                                try {
-                                    val speechSegment = SimulateStreamingAsr.vad.front()
-                                    val samples = speechSegment.samples
-                                    
-                                    Log.i(TAG, "Processing final speech segment, samples: ${samples.size}")
-                                    
-                                    // ASR 识别
-                                    val stream = SimulateStreamingAsr.recognizer.createStream()
-                                    stream.acceptWaveform(samples, sampleRateInHz)
-                                    SimulateStreamingAsr.recognizer.decode(stream)
-                                    val result = SimulateStreamingAsr.recognizer.getResult(stream)
-                                    stream.release()
-                                    
-                                    Log.i(TAG, "Final ASR result: ${result.text}")
-
-                                    // 🎤 说话人识别（限制最多15个）
-                                    var speakerName = "Unknown"
-                                    try {
-                                        val embedding = SimulateStreamingAsr.extractEmbedding(
-                                            samples, 
-                                            sampleRateInHz
-                                        )
-                                        
-                                        if (embedding != null) {
-                                            speakerName = SimulateStreamingAsr.identifyOrRegisterSpeaker(
-                                                embedding,
-                                                maxSpeakers = 15  // ✅ 限制最多15个说话人
-                                            )
-                                        }
-                                    } catch (e: Exception) {
-                                        Log.e(TAG, "Speaker identification error: ${e.message}", e)
-                                    }
-
-                                    isSpeechStarted = false
-                                    SimulateStreamingAsr.vad.pop()
-
-                                    buffer = arrayListOf()
-                                    offset = 0
-                                    
-                                    if (result.text.isNotBlank()) {
-                                        // 🕐 计算时间戳
-                                        val timestamp = formatTimestamp(speechStartTime - recordingStartTime.value)
-                                        
-                                        // ✅ 保留之前的翻译（如果有）
-                                        val oldTranslation = if (added && currentIndex >= 0 && currentIndex < resultList.size) {
-                                            resultList[currentIndex].translatedText
-                                        } else null
-                                        
-                                        // 创建最终结果
-                                        val finalResult = SpeakerResult(
-                                            timestamp = timestamp,
-                                            speakerName = speakerName,
-                                            originalText = result.text,
-                                            translatedText = oldTranslation,  // 保留旧译文
-                                            isFinal = true
-                                        )
-                                        
-                                        if (added && currentIndex >= 0 && currentIndex < resultList.size) {
-                                            // 更新现有条目
-                                            resultList[currentIndex] = finalResult
-                                        } else {
-                                            // 添加新条目
-                                            resultList.add(finalResult)
-                                            currentIndex = resultList.size - 1
-                                        }
-
-                                        coroutineScope.launch {
-                                            lazyColumnListState.animateScrollToItem(resultList.size - 1)
-                                        }
-                                        
-                                        // 🔥 翻译最终结果
-                                        if (SimulateStreamingAsr.isTranslatorReady()) {
-                                            // 取消之前的翻译任务
-                                            translationJobs[currentIndex]?.cancel()
-                                            
-                                            val finalIndex = currentIndex
-                                            val job = CoroutineScope(Dispatchers.IO).launch {
-                                                try {
-                                                    // 检查缓存
-                                                    val cachedTranslation = translationCache[result.text]
-                                                    val translation = if (cachedTranslation != null) {
-                                                        Log.d(TAG, "Using cached translation for final: ${result.text}")
-                                                        cachedTranslation
-                                                    } else {
-                                                        Log.d(TAG, "Translating final: ${result.text}")
-                                                        val trans = SimulateStreamingAsr.translateText(result.text)
-                                                        if (trans != null && trans.isNotEmpty()) {
-                                                            translationCache[result.text] = trans
-                                                            trans
-                                                        } else null
-                                                    }
-                                                    
-                                                    // ✅ 直接更新最终翻译
-                                                    if (translation != null && finalIndex >= 0 && finalIndex < resultList.size) {
-                                                        resultList[finalIndex] = resultList[finalIndex].copy(
-                                                            translatedText = translation
-                                                        )
-                                                    }
-                                                } catch (e: CancellationException) {
-                                                    Log.d(TAG, "Final translation cancelled")
-                                                } catch (e: Exception) {
-                                                    Log.e(TAG, "Final translation error: ${e.message}")
-                                                }
-                                            }
-                                            translationJobs[finalIndex] = job
-                                        }
-                                        
-                                        added = false
-                                    }
-                                } catch (e: Exception) {
-                                    Log.e(TAG, "Error processing speech segment: ${e.message}", e)
-                                    SimulateStreamingAsr.vad.pop()
-                                    buffer = arrayListOf()
-                                    offset = 0
-                                }
-                            }
-                        }
-                    }
-                }
+                isStarted = false
+                return@Unit
             }
-        } else {
-            audioRecord?.stop()
-            audioRecord?.release()
-            audioRecord = null
             
-            // 取消所有翻译任务
-            translationJobs.values.forEach { it.cancel() }
-            translationJobs.clear()
+            // 初始化 Pipeline
+            speechPipeline = SpeechPipeline(
+                onIntermediateResult = onIntermediateResult,
+                onFinalResult = onFinalResult,
+                onTranslationUpdate = onTranslationUpdate
+            )
+            speechPipeline?.start()
+            
+            // 启动音频录制
+            audioRecorder = AudioRecorder(sampleRate = ModelConfig.Runtime.SAMPLE_RATE)
+            val success = audioRecorder?.start { samples ->
+                speechPipeline?.feedAudio(samples)
+            }
+            
+            if (success != true) {
+                Toast.makeText(context, "Failed to start recording", Toast.LENGTH_SHORT).show()
+                isStarted = false
+                speechPipeline?.stop()
+                speechPipeline = null
+            }
+            
+        } else {
+            audioRecorder?.stop()
+            audioRecorder = null
+            speechPipeline?.stop()
+            speechPipeline = null
         }
     }
     
@@ -402,9 +175,6 @@ fun HomeScreen() {
                 },
                 onClearButtonClick = {
                     resultList.clear()
-                    translationCache.clear()
-                    translationJobs.values.forEach { it.cancel() }
-                    translationJobs.clear()
                 }
             )
 
@@ -473,14 +243,6 @@ fun HomeScreen() {
     }
 }
 
-// 🕐 格式化时间戳（毫秒 -> MM:SS）
-fun formatTimestamp(milliseconds: Long): String {
-    val totalSeconds = milliseconds / 1000
-    val minutes = totalSeconds / 60
-    val seconds = totalSeconds % 60
-    return String.format("%02d:%02d", minutes, seconds)
-}
-
 @Composable
 fun getSpeakerColor(speakerName: String): Color {
     val colors = listOf(
@@ -504,7 +266,7 @@ fun getSpeakerColor(speakerName: String): Color {
     return when {
         speakerName == "..." -> Color.Gray
         speakerName == "Unknown" -> Color.DarkGray
-        speakerName == "S" -> Color(0xFF757575)  // ✅ 超过15个说话人用灰色
+        speakerName == "S" -> Color(0xFF757575)  // 超过15个说话人用灰色
         speakerName.startsWith("Speaker ") -> {
             val num = speakerName.removePrefix("Speaker ").toIntOrNull() ?: 0
             if (num > 0 && num <= 15) {
@@ -517,7 +279,6 @@ fun getSpeakerColor(speakerName: String): Color {
     }
 }
 
-@SuppressLint("UnrememberedMutableState")
 @Composable
 private fun HomeButtonRow(
     modifier: Modifier = Modifier,

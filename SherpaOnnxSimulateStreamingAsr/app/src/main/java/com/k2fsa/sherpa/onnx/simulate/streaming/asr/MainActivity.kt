@@ -32,6 +32,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
+import com.k2fsa.sherpa.onnx.config.ModelConfig
 import com.k2fsa.sherpa.onnx.simulate.streaming.asr.screens.HelpScreen
 import com.k2fsa.sherpa.onnx.simulate.streaming.asr.screens.HomeScreen
 import com.k2fsa.sherpa.onnx.simulate.streaming.asr.ui.theme.SimulateStreamingAsrTheme
@@ -58,45 +59,67 @@ class MainActivity : ComponentActivity() {
         }
         ActivityCompat.requestPermissions(this, permissions, REQUEST_RECORD_AUDIO_PERMISSION)
 
-        // 初始化各个模块
+        // 统一初始化所有模块
+        initializeAllModels()
+    }
+    
+    /**
+     * 统一初始化所有模型
+     */
+    private fun initializeAllModels() {
         Log.i(TAG, "========================================")
         Log.i(TAG, "Initializing all components...")
         Log.i(TAG, "========================================")
         
-        // 1. 初始化ASR识别器
-        SimulateStreamingAsr.initOfflineRecognizer(this.assets, this.application)
-        
-        // 2. 初始化VAD
-        SimulateStreamingAsr.initVad(this.assets)
-        
-        // 3. 初始化说话人识别
-        SimulateStreamingAsr.initSpeakerIdentification(this.assets)
-        
-        // 4. 初始化翻译器
         try {
-            Log.i(TAG, "Initializing Helsinki translator...")
+            // 1. 初始化ASR识别器
+            SimulateStreamingAsr.initOfflineRecognizer(this.assets, this.application)
             
-            SimulateStreamingAsr.initTranslator(
-                assetManager = this.assets,
-                cacheDir = this.cacheDir,  // ← 关键：传入缓存目录
-                modelDir = "helsinki-translation/en-zh"  // ✅ 添加这一行
-            )
+            // 2. 初始化VAD
+            SimulateStreamingAsr.initVad(this.assets)
             
-            if (SimulateStreamingAsr.isTranslatorReady()) {
-                Log.i(TAG, "Helsinki translator initialized successfully ✓")
-                Toast.makeText(this, "Translation enabled (zh→en)", Toast.LENGTH_SHORT).show()
+            // 3. 初始化说话人识别（如果启用）
+            if (ModelConfig.Features.ENABLE_SPEAKER_ID) {
+                SimulateStreamingAsr.initSpeakerIdentification(this.assets)
             } else {
-                Log.w(TAG, "Helsinki translator initialization failed")
-                Toast.makeText(this, "Translation unavailable", Toast.LENGTH_LONG).show()
+                Log.i(TAG, "Speaker ID disabled by config")
             }
+            
+            // 4. 初始化翻译器（如果启用）
+            if (ModelConfig.Features.ENABLE_TRANSLATION) {
+                try {
+                    Log.i(TAG, "Initializing Helsinki translator...")
+                    
+                    SimulateStreamingAsr.initTranslator(
+                        assetManager = this.assets,
+                        cacheDir = this.cacheDir,
+                        modelDir = ModelConfig.Selection.TRANSLATION_MODEL_DIR,
+                        maxCacheSize = ModelConfig.Cache.MAX_TRANSLATION_CACHE_SIZE
+                    )
+                    
+                    if (SimulateStreamingAsr.isTranslatorReady()) {
+                        Log.i(TAG, "Helsinki translator initialized successfully ✓")
+                        Toast.makeText(this, "Translation enabled (EN→ZH)", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Log.w(TAG, "Helsinki translator initialization failed")
+                        Toast.makeText(this, "Translation unavailable", Toast.LENGTH_LONG).show()
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to initialize translator", e)
+                    Toast.makeText(this, "Translation error: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            } else {
+                Log.i(TAG, "Translation disabled by config")
+            }
+            
+            Log.i(TAG, "========================================")
+            Log.i(TAG, "All components initialization completed")
+            Log.i(TAG, "========================================")
+            
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to initialize translator", e)
-            Toast.makeText(this, "Translation error: ${e.message}", Toast.LENGTH_LONG).show()
+            Log.e(TAG, "Initialization error", e)
+            Toast.makeText(this, "Initialization error: ${e.message}", Toast.LENGTH_LONG).show()
         }
-        
-        Log.i(TAG, "========================================")
-        Log.i(TAG, "All components initialization completed")
-        Log.i(TAG, "========================================")
     }
 
     @Deprecated("Deprecated in Java")
