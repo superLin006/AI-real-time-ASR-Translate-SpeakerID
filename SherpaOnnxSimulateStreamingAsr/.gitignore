@@ -13,3 +13,18 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# 模型文件 - 请从指定位置下载后放置
+# Model files - Please download and place from specified sources
+*.onnx
+*.rknn
+*.bin
+*.spm
+app/src/main/assets/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx
+app/src/main/assets/silero_vad.onnx
+app/src/main/assets/sense-voice-rknn/
+app/src/main/assets/helsinki-translation/
+
+# 原生库文件 - 需要从 Sherpa-ONNX 预编译包获取
+# Native libraries - Obtain from Sherpa-ONNX prebuilt packages
+app/src/main/jniLibs/arm64-v8a/*.so
