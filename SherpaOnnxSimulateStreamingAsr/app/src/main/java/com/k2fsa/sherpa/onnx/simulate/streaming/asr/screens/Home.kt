@@ -115,32 +115,32 @@ fun HomeScreen() {
         isStarted = !isStarted
         
         if (isStarted) {
+            // 检查录音权限
             if (ActivityCompat.checkSelfPermission(activity, Manifest.permission.RECORD_AUDIO) 
                 != PackageManager.PERMISSION_GRANTED) {
                 Log.i(TAG, "Recording is not allowed")
                 isStarted = false
-                return@Unit
-            }
-            
-            // 初始化 Pipeline
-            speechPipeline = SpeechPipeline(
-                onIntermediateResult = onIntermediateResult,
-                onFinalResult = onFinalResult,
-                onTranslationUpdate = onTranslationUpdate
-            )
-            speechPipeline?.start()
-            
-            // 启动音频录制
-            audioRecorder = AudioRecorder(sampleRate = ModelConfig.Runtime.SAMPLE_RATE)
-            val success = audioRecorder?.start { samples ->
-                speechPipeline?.feedAudio(samples)
-            }
-            
-            if (success != true) {
-                Toast.makeText(context, "Failed to start recording", Toast.LENGTH_SHORT).show()
-                isStarted = false
-                speechPipeline?.stop()
-                speechPipeline = null
+            } else {
+                // 初始化 Pipeline
+                speechPipeline = SpeechPipeline(
+                    onIntermediateResult = onIntermediateResult,
+                    onFinalResult = onFinalResult,
+                    onTranslationUpdate = onTranslationUpdate
+                )
+                speechPipeline?.start()
+                
+                // 启动音频录制
+                audioRecorder = AudioRecorder(sampleRate = ModelConfig.Runtime.SAMPLE_RATE)
+                val success = audioRecorder?.start { samples ->
+                    speechPipeline?.feedAudio(samples)
+                }
+                
+                if (success != true) {
+                    Toast.makeText(context, "Failed to start recording", Toast.LENGTH_SHORT).show()
+                    isStarted = false
+                    speechPipeline?.stop()
+                    speechPipeline = null
+                }
             }
             
         } else {

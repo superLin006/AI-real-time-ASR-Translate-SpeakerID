@@ -759,6 +759,29 @@ fun getOfflineModelConfig(type: Int): OfflineModelConfig? {
             )
         }
 
+        
+        
+        // ========================================================================
+        // MTK NPU 模型配置
+        // ========================================================================
+
+        1000 -> {
+            // MTK SenseVoice - 中英日韩粤多语言识别
+            // 需要 .dla 格式模型（使用 MTK SDK 从 ONNX 转换）
+            val modelDir = "sense-voice-mtk"
+            return OfflineModelConfig(
+                senseVoice = OfflineSenseVoiceModelConfig(
+                    model = "$modelDir/sensevoice-10s.dla",  // MTK .dla 格式模型
+                    language = "auto",               // 自动检测: auto, zh, en, ja, ko, yue
+                    useInverseTextNormalization = true
+                ),
+                tokens = "$modelDir/tokens.txt",
+                provider = "mtk",     // 🔑 关键：使用 MTK NPU
+                numThreads = 1,       // MTK NPU 模式下使用 1 线程
+            )
+        }
+        
+        
         101 -> {
             val modelDir = "whisper-base-rknn"
             return OfflineModelConfig(

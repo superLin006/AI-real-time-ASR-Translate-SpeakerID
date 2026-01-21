@@ -15,7 +15,7 @@ object ModelConfig {
          * 2 = silero-vad-v4-rk3576.rknn (RKNN)
          */
         const val VAD_MODEL_TYPE = 0
-        
+
         /**
          * ASR 模型类型
          * 见 OfflineRecognizer.kt 的 getOfflineModelConfig() 方法
@@ -25,17 +25,41 @@ object ModelConfig {
          * 其他见代码注释
          */
         const val ASR_MODEL_TYPE = 100
-        
+
         /**
          * 说话人识别模型
          */
         const val SPEAKER_MODEL = "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx"
-        
+
         /**
-         * 翻译模型目录
-         * helsinki-translation/en-zh = 英文 → 中文
+         * 翻译模式
+         * "BIDIRECTIONAL" = 双向翻译（中英互译，根据ASR语言检测自动选择方向）
+         * "UNIDIRECTIONAL" = 单向翻译（不管输入什么语言，都用指定模型翻译）
          */
-        const val TRANSLATION_MODEL_DIR = "helsinki-translation/zh-en"
+        const val TRANSLATION_MODE = "BIDIRECTIONAL"
+
+        /**
+         * 翻译模型配置
+         *
+         * 双向翻译模式 (TRANSLATION_MODE = "BIDIRECTIONAL"):
+         *   - SOURCE_LANG1 = "en", TARGET_LANG1 = "zh"  → 加载 helsinki-translation/en-zh
+         *   - SOURCE_LANG2 = "zh", TARGET_LANG2 = "en"  → 加载 helsinki-translation/zh-en
+         *   - 根据ASR检测的语言自动选择翻译器
+         *
+         * 单向翻译模式 (TRANSLATION_MODE = "UNIDIRECTIONAL"):
+         *   - 只使用 TRANSLATION_MODEL_DIR 指定的模型
+         *   - 不检查语言，所有识别结果都用这个模型翻译
+         *   - 示例：ko-en 模型，不管说韩语、英语还是日语，都按韩语翻译成英语
+         */
+
+        // 双向翻译配置（仅在 BIDIRECTIONAL 模式生效）
+        const val SOURCE_LANG1 = "en"
+        const val TARGET_LANG1 = "zh"
+        const val SOURCE_LANG2 = "zh"
+        const val TARGET_LANG2 = "en"
+
+        // 单向翻译配置（仅在 UNIDIRECTIONAL 模式生效）
+        const val TRANSLATION_MODEL_DIR = "helsinki-translation/ko-en"
     }
     
     // ========== 运行参数 ==========
@@ -89,6 +113,7 @@ object ModelConfig {
         /**
          * ASR 中间结果更新间隔 (毫秒)
          * 实时显示识别进度的间隔
+         * 推荐值：200ms(流畅) / 400ms(平衡) / 600ms(省电)
          */
         const val ASR_INTERMEDIATE_INTERVAL = 400L
     }

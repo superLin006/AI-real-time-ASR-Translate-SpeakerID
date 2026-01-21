@@ -67,6 +67,12 @@ class SpeechPipeline(
      * 核心处理流程（完全保留原有逻辑）
      */
     private suspend fun processAudioStream() {
+        // 检查所有必需组件是否已初始化
+        if (!SimulateStreamingAsr.isVadReady()) {
+            Log.e(TAG, "VAD is not ready. Cannot process audio.")
+            return
+        }
+
         var buffer = arrayListOf<Float>()
         var offset = 0
         var isSpeechStarted = false
@@ -74,7 +80,7 @@ class SpeechPipeline(
         var startTime = System.currentTimeMillis()
         var lastText = ""
         var added = false  // 标记是否已添加中间结果
-        
+
         while (isRunning) {
             for (samples in samplesChannel) {
                 if (samples.isEmpty()) break
@@ -106,21 +112,27 @@ class SpeechPipeline(
                     SimulateStreamingAsr.recognizer.decode(stream)
                     val result = SimulateStreamingAsr.recognizer.getResult(stream)
                     stream.release()
-                    
+
                     lastText = result.text
-                    
+
                     if (lastText.isNotBlank()) {
                         val timestamp = formatTimestamp(speechStartTime - recordingStartTime)
-                        
+
+                        // 🆕 检测语言（中间结果也检测）
+                        val intermediateLang = extractLanguageCode(result.lang)
+                        val targetLang = SimulateStreamingAsr.getTargetLanguage(intermediateLang)
+
                         // 创建中间结果
                         val tempResult = PipelineResult(
                             timestamp = timestamp,
                             speakerName = "...",
                             originalText = lastText,
                             translatedText = null,
-                            isFinal = false
+                            isFinal = false,
+                            detectedLanguage = intermediateLang,
+                            targetLanguage = targetLang
                         )
-                        
+
                         // 🔥 关键：与原代码逻辑完全一致
                         if (!added) {
                             currentResultIndex++
@@ -129,10 +141,10 @@ class SpeechPipeline(
                         } else {
                             onIntermediateResult(tempResult)  // 更新中间结果
                         }
-                        
+
                         // 实时翻译（如果启用）
                         if (ModelConfig.Features.ENABLE_REALTIME_TRANSLATION) {
-                            maybeTranslate(lastText, currentResultIndex, isFinal = false)
+                            maybeTranslate(lastText, currentResultIndex, isFinal = false, detectedLang = intermediateLang)
                         }
                     }
                     
@@ -153,8 +165,12 @@ class SpeechPipeline(
                         SimulateStreamingAsr.recognizer.decode(stream)
                         val asrResult = SimulateStreamingAsr.recognizer.getResult(stream)
                         stream.release()
-                        
+
                         Log.i(TAG, "Final ASR result: ${asrResult.text}")
+
+                        // 🆕 自动语言检测
+                        val detectedLang = extractLanguageCode(asrResult.lang)
+                        Log.i(TAG, "Detected language: $detectedLang (${asrResult.lang})")
                         
                         // 说话人识别
                         var speakerName = "Unknown"
@@ -183,14 +199,20 @@ class SpeechPipeline(
                         
                         if (asrResult.text.isNotBlank()) {
                             val timestamp = formatTimestamp(speechStartTime - recordingStartTime)
-                            
+
+                            // 🆕 确定翻译方向（使用配置化的方法）
+                            val targetLang = SimulateStreamingAsr.getTargetLanguage(detectedLang)
+                            Log.i(TAG, "Translation direction: $detectedLang → ${targetLang ?: "none"}")
+
                             // 创建最终结果
                             val finalResult = PipelineResult(
                                 timestamp = timestamp,
                                 speakerName = speakerName,
                                 originalText = asrResult.text,
                                 translatedText = null,
-                                isFinal = true
+                                isFinal = true,
+                                detectedLanguage = detectedLang,  // 🆕 添加检测到的语言
+                                targetLanguage = targetLang        // 🆕 添加目标语言
                             )
                             
                             // 🔥 关键：与原代码逻辑完全一致
@@ -202,10 +224,10 @@ class SpeechPipeline(
                                 currentResultIndex++
                                 onFinalResult(finalResult)
                             }
-                            
-                            // 翻译最终结果
+
+                            // 翻译最终结果（传入检测到的语言）
                             if (ModelConfig.Features.ENABLE_TRANSLATION) {
-                                maybeTranslate(asrResult.text, currentResultIndex, isFinal = true)
+                                maybeTranslate(asrResult.text, currentResultIndex, isFinal = true, detectedLang = detectedLang)
                             }
                             
                             added = false  // 重置标记
@@ -224,31 +246,63 @@ class SpeechPipeline(
     
     /**
      * 翻译逻辑（带防抖和缓存）
+     * 支持配置化的翻译模式（双向/单向）
      */
-    private fun maybeTranslate(text: String, resultIndex: Int, isFinal: Boolean) {
+    private fun maybeTranslate(text: String, resultIndex: Int, isFinal: Boolean, detectedLang: String? = null) {
         if (!SimulateStreamingAsr.isTranslatorReady()) return
-        
+
         val now = System.currentTimeMillis()
         if (!isFinal && (now - lastTranslationTime) < ModelConfig.Pipeline.MIN_TRANSLATION_INTERVAL) {
             return  // 防抖：太频繁则跳过
         }
-        
+
         lastTranslationTime = now
-        
+
         // 取消旧任务
         translationJobs[resultIndex]?.cancel()
-        
+
         // 启动新翻译任务
         val job = CoroutineScope(Dispatchers.IO).launch {
             try {
+                val mode = ModelConfig.Selection.TRANSLATION_MODE
+
+                // 确定源语言
+                val sourceLang = when (mode) {
+                    "BIDIRECTIONAL" -> {
+                        // 双向模式：使用检测到的语言，如果没有则跳过
+                        val lang = detectedLang ?: "auto"
+                        // 检查是否支持该语言的翻译
+                        val targetLang = SimulateStreamingAsr.getTargetLanguage(lang)
+                        if (targetLang == null) {
+                            Log.d(TAG, "Language '$lang' not configured for translation, skipping")
+                            return@launch
+                        }
+                        lang
+                    }
+                    "UNIDIRECTIONAL" -> {
+                        // 单向模式：不检查语言，直接翻译（使用通配符）
+                        "*"
+                    }
+                    else -> {
+                        Log.w(TAG, "Unknown translation mode: $mode")
+                        return@launch
+                    }
+                }
+
                 // 检查缓存
-                val translation = if (ModelConfig.Cache.ENABLE_TRANSLATION_CACHE && 
+                val translation = if (ModelConfig.Cache.ENABLE_TRANSLATION_CACHE &&
                                       translationCache.containsKey(text)) {
                     Log.d(TAG, "Using cached translation for: $text")
                     translationCache[text]!!
                 } else {
-                    Log.d(TAG, "Translating ${if (isFinal) "final" else "intermediate"}: $text")
-                    val trans = SimulateStreamingAsr.translateText(text)
+                    val direction = if (mode == "BIDIRECTIONAL") {
+                        "$sourceLang→${SimulateStreamingAsr.getTargetLanguage(sourceLang)}"
+                    } else {
+                        "unidirectional"
+                    }
+                    Log.d(TAG, "Translating ${if (isFinal) "final" else "intermediate"} [$direction]: $text")
+
+                    val trans = SimulateStreamingAsr.translateText(text, sourceLang)
                     if (trans != null && trans.isNotEmpty()) {
                         if (ModelConfig.Cache.ENABLE_TRANSLATION_CACHE) {
                             translationCache[text] = trans
@@ -256,7 +310,7 @@ class SpeechPipeline(
                         trans
                     } else null
                 }
-                
+
                 // 更新翻译
                 if (translation != null) {
                     onTranslationUpdate(resultIndex, translation)
@@ -279,6 +333,27 @@ class SpeechPipeline(
         val seconds = totalSeconds % 60
         return String.format("%02d:%02d", minutes, seconds)
     }
+
+    // ========== 🆕 语言检测辅助函数 ==========
+
+    /**
+     * 从 ASR 的 lang 字段提取语言代码
+     * 支持 SenseVoice 格式 ("<|en|>") 和其他格式 ("en")
+     * @param langSymbol ASR 输出的语言标识
+     * @return 标准化的语言代码 "en", "zh", "yue", "ja", "ko", 或 "auto"
+     */
+    private fun extractLanguageCode(langSymbol: String?): String {
+        if (langSymbol.isNullOrEmpty()) return "auto"
+
+        // SenseVoice 格式：<|lang|>
+        if (langSymbol.startsWith("<|") && langSymbol.endsWith("|>")) {
+            val lang = langSymbol.substring(2, langSymbol.length - 2)
+            return lang.lowercase()
+        }
+
+        // 其他格式：直接返回小写
+        return langSymbol.lowercase()
+    }
 }
 
 /**
@@ -289,5 +364,7 @@ data class PipelineResult(
     val speakerName: String,
     val originalText: String,
     val translatedText: String?,
-    val isFinal: Boolean
+    val isFinal: Boolean,
+    val detectedLanguage: String = "auto",  // 🆕 检测到的语言
+    val targetLanguage: String? = null      // 🆕 目标语言（翻译方向）
 )

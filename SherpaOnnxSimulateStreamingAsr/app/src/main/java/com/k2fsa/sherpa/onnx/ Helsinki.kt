@@ -6,33 +6,50 @@ import java.io.File
 import java.io.FileOutputStream
 
 /**
- * Helsinki ONNX 翻译模块（英文→中文）
- * 最终工作版本
+ * Helsinki ONNX 翻译模块 - 多实例版本
+ *
+ * 支持同时创建多个翻译器实例，用于加载不同的翻译模型（如 en-zh 和 zh-en）
  */
-object HelsinkiONNXKV {
-    private const val TAG = "HelsinkiONNXKV"
-    
-    private var isInitialized = false
-    private var libraryLoadFailed = false
-    
-    init {
-        try {
-            System.loadLibrary("onnxruntime")
-            Log.i(TAG, "ONNX Runtime library loaded successfully")
-            
-            Thread.sleep(100)
-            
-            System.loadLibrary("helsinki-onnx-jni")
-            Log.i(TAG, "Helsinki native library loaded successfully")
-            
-        } catch (e: UnsatisfiedLinkError) {
-            libraryLoadFailed = true
-            Log.e(TAG, "Failed to load libraries", e)
+class HelsinkiONNXKV {
+    companion object {
+        private const val TAG = "HelsinkiONNXKV"
+        private var libraryLoadFailed = false
+
+        init {
+            try {
+                System.loadLibrary("onnxruntime")
+                Log.i(TAG, "ONNX Runtime library loaded successfully")
+
+                Thread.sleep(100)
+
+                System.loadLibrary("helsinki-onnx-jni")
+                Log.i(TAG, "Helsinki native library loaded successfully")
+
+            } catch (e: UnsatisfiedLinkError) {
+                libraryLoadFailed = true
+                Log.e(TAG, "Failed to load libraries", e)
+            }
         }
+
+        @JvmStatic
+        external fun getApiVersionMulti(): String
+
+        /**
+         * 设置JNI日志级别
+         * @param level 0=仅ERROR, 1=INFO+ERROR
+         */
+        @JvmStatic
+        external fun setLogLevel(level: Int)
     }
-    
-    @JvmStatic
-    private external fun initSession(
+
+    // 实例句柄（C++ 对象指针）
+    private var nativeHandle: Long = 0
+    private var isInitialized = false
+
+    // Native 方法（实例方法）
+    private external fun createInstance(): Long
+    private external fun initInstance(
+        handle: Long,
         encoderPath: String,
         decoderPath: String,
         decoderWithPastPath: String,
@@ -41,19 +58,11 @@ object HelsinkiONNXKV {
         vocabTxt: String,
         verbose: Boolean
     ): Int
-    
-    @JvmStatic
-    private external fun translate(text: String): String?
-    
-    @JvmStatic
-    private external fun releaseSession(): Int
-    
-    @JvmStatic
-    external fun setVerboseMode(verbose: Boolean)
-    
-    @JvmStatic
-    external fun getApiVersion(): String
-    
+
+    private external fun translateWithInstance(handle: Long, text: String): String?
+    private external fun isInstanceInitialized(handle: Long): Boolean
+    private external fun destroyInstance(handle: Long)
+
     private fun copyAssetToFile(
         assetManager: AssetManager,
         assetPath: String,
@@ -61,13 +70,13 @@ object HelsinkiONNXKV {
     ): Boolean {
         return try {
             Log.d(TAG, "Copying $assetPath to ${destFile.absolutePath}")
-            
+
             assetManager.open(assetPath).use { input ->
                 FileOutputStream(destFile).use { output ->
                     input.copyTo(output)
                 }
             }
-            
+
             val success = destFile.exists()
             if (success) {
                 Log.d(TAG, "✓ Copied: ${destFile.length()} bytes")
@@ -80,40 +89,48 @@ object HelsinkiONNXKV {
             false
         }
     }
-    
+
     fun init(
         assetManager: AssetManager?,
         cacheDir: File,
         modelDir: String = "helsinki-translation/en-zh",
         verbose: Boolean = true,
-        maxCacheSize: Long = 500 * 1024 * 1024  // ✅ 新增：默认500MB限制
+        maxCacheSize: Long = 500 * 1024 * 1024  // 默认500MB限制
     ): Boolean {
         if (libraryLoadFailed) {
             Log.e(TAG, "Cannot initialize: library failed to load")
             return false
         }
-        
+
         if (isInitialized) {
-            Log.w(TAG, "Already initialized")
+            Log.w(TAG, "Instance already initialized")
             return true
         }
-        
+
         if (assetManager == null) {
             Log.e(TAG, "AssetManager is null")
             return false
         }
-        
+
         Log.i(TAG, "========================================")
-        Log.i(TAG, "Initializing Helsinki Translator")
+        Log.i(TAG, "Initializing Helsinki Translator Instance")
         Log.i(TAG, "========================================")
         Log.i(TAG, "Assets path: $modelDir")
         Log.i(TAG, "Cache dir: ${cacheDir.absolutePath}")
-        
+
         try {
-            // ✅ 修改：使用分层缓存目录
+            // 创建 C++ 实例
+            nativeHandle = createInstance()
+            if (nativeHandle == 0L) {
+                Log.e(TAG, "Failed to create native instance")
+                return false
+            }
+            Log.i(TAG, "Native instance created: 0x${nativeHandle.toString(16)}")
+
+            // 准备模型文件
             val helsinkiCacheRoot = File(cacheDir, "helsinki-models")
-            val tempDir = File(helsinkiCacheRoot, modelDir.replace("/", "_"))  // en-zh -> en_zh
-            
+            val tempDir = File(helsinkiCacheRoot, modelDir.replace("/", "_"))
+
             if (!tempDir.exists()) {
                 if (tempDir.mkdirs()) {
                     Log.i(TAG, "Created temp directory: ${tempDir.absolutePath}")
@@ -122,37 +139,35 @@ object HelsinkiONNXKV {
                     return false
                 }
             }
-            
-            // ✅ 新增：更新访问时间（用于LRU）
+
+            // 更新访问时间（用于LRU）
             try {
                 File(tempDir, ".last_access").writeText(System.currentTimeMillis().toString())
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to update access time: ${e.message}")
             }
-            
-            // ✅ 新增：LRU缓存清理逻辑
+
+            // LRU缓存清理逻辑（同原版）
             try {
                 if (helsinkiCacheRoot.exists()) {
-                    val allDirs = helsinkiCacheRoot.listFiles()?.filter { 
-                        it.isDirectory && !it.name.startsWith(".")  // 排除隐藏目录
+                    val allDirs = helsinkiCacheRoot.listFiles()?.filter {
+                        it.isDirectory && !it.name.startsWith(".")
                     } ?: emptyList()
-                    
-                    // 计算总缓存大小
-                    val totalSize = allDirs.sumOf { dir -> 
+
+                    val totalSize = allDirs.sumOf { dir ->
                         dir.walkTopDown()
                             .filter { it.isFile && !it.name.startsWith(".") }
                             .map { it.length() }
-                            .sum() 
+                            .sum()
                     }
-                    
+
                     Log.d(TAG, "Current cache size: ${totalSize / 1024 / 1024}MB (limit: ${maxCacheSize / 1024 / 1024}MB)")
-                    
+
                     if (totalSize > maxCacheSize) {
                         Log.w(TAG, "Cache size exceeds limit, starting LRU cleanup...")
-                        
+
                         val currentDirName = modelDir.replace("/", "_")
-                        
-                        // 按最后访问时间排序
+
                         val sortedDirs = allDirs.sortedBy { dir ->
                             val accessFile = File(dir, ".last_access")
                             if (accessFile.exists()) {
@@ -165,26 +180,23 @@ object HelsinkiONNXKV {
                                 0L
                             }
                         }
-                        
-                        // 删除最旧的缓存
+
                         var currentSize = totalSize
                         for (dir in sortedDirs) {
                             if (dir.name == currentDirName) {
-                                // 不删除当前模型
                                 continue
                             }
-                            
+
                             val dirSize = dir.walkTopDown()
                                 .filter { it.isFile }
                                 .map { it.length() }
                                 .sum()
-                            
+
                             Log.i(TAG, "Removing old cache: ${dir.name} (${dirSize / 1024 / 1024}MB)")
                             dir.deleteRecursively()
                             currentSize -= dirSize
-                            
-                            // 达到限制就停止
-                            if (currentSize <= maxCacheSize * 0.8) {  // 保留20%余量
+
+                            if (currentSize <= maxCacheSize * 0.8) {
                                 Log.i(TAG, "Cache cleanup completed, new size: ${currentSize / 1024 / 1024}MB")
                                 break
                             }
@@ -193,9 +205,8 @@ object HelsinkiONNXKV {
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Error during cache cleanup: ${e.message}", e)
-                // 清理失败不影响继续运行
             }
-            
+
             val fileMap = linkedMapOf(
                 "encoder_model.onnx" to "encoder",
                 "decoder_model.onnx" to "decoder",
@@ -204,24 +215,24 @@ object HelsinkiONNXKV {
                 "target.spm" to "target_spm",
                 "vocab.txt" to "vocab"
             )
-            
+
             val filePaths = mutableMapOf<String, String>()
-            
+
             Log.i(TAG, "Preparing model files...")
-            
+
             for ((filename, key) in fileMap) {
                 val assetPath = "$modelDir/$filename"
-                val destFile = File(tempDir, filename)  // ✅ 使用新的分层目录
-                
+                val destFile = File(tempDir, filename)
+
                 var needCopy = !destFile.exists()
-                
+
                 if (!needCopy) {
                     try {
                         val assetFd = assetManager.openFd(assetPath)
                         val assetSize = assetFd.length
                         assetFd.close()
                         val cachedSize = destFile.length()
-                        
+
                         if (assetSize != cachedSize) {
                             Log.w(TAG, "  $filename: size mismatch (cached=$cachedSize, asset=$assetSize)")
                             needCopy = true
@@ -233,7 +244,7 @@ object HelsinkiONNXKV {
                         needCopy = true
                     }
                 }
-                
+
                 if (needCopy) {
                     Log.i(TAG, "  Copying: $filename")
                     if (!copyAssetToFile(assetManager, assetPath, destFile)) {
@@ -241,24 +252,25 @@ object HelsinkiONNXKV {
                         return false
                     }
                 }
-                
+
                 if (!destFile.exists() || destFile.length() == 0L) {
                     Log.e(TAG, "✗ Invalid file: ${destFile.absolutePath}")
                     return false
                 }
-                
+
                 filePaths[key] = destFile.absolutePath
             }
-            
+
             Log.i(TAG, "Model files ready:")
             filePaths.forEach { (key, path) ->
                 val file = File(path)
                 Log.i(TAG, "  $key: ${file.name} (${file.length()} bytes)")
             }
-            
+
             Log.i(TAG, "Calling native initialization...")
-            
-            val ret = initSession(
+
+            val ret = initInstance(
+                handle = nativeHandle,
                 encoderPath = filePaths["encoder"]!!,
                 decoderPath = filePaths["decoder"]!!,
                 decoderWithPastPath = filePaths["decoder_with_past"]!!,
@@ -267,14 +279,14 @@ object HelsinkiONNXKV {
                 vocabTxt = filePaths["vocab"]!!,
                 verbose = verbose
             )
-            
+
             isInitialized = (ret == 0)
-            
+
             Log.i(TAG, "========================================")
             if (isInitialized) {
-                Log.i(TAG, "✓ Helsinki translator initialized successfully!")
+                Log.i(TAG, "✓ Helsinki translator instance initialized successfully!")
                 try {
-                    Log.i(TAG, "API Version: ${getApiVersion()}")
+                    Log.i(TAG, "API Version: ${getApiVersionMulti()}")
                 } catch (e: Exception) {
                     Log.w(TAG, "Cannot get API version: ${e.message}")
                 }
@@ -282,27 +294,27 @@ object HelsinkiONNXKV {
                 Log.e(TAG, "✗ Initialization failed with code: $ret")
             }
             Log.i(TAG, "========================================")
-            
+
             return isInitialized
-            
+
         } catch (e: Exception) {
             Log.e(TAG, "Exception during initialization", e)
             Log.e(TAG, "========================================")
             return false
         }
     }
-    
+
     fun translateText(text: String): String? {
-        if (libraryLoadFailed || !isInitialized) {
-            Log.w(TAG, "Translator not ready (lib=$libraryLoadFailed, init=$isInitialized)")
+        if (libraryLoadFailed || !isInitialized || nativeHandle == 0L) {
+            Log.w(TAG, "Translator not ready (lib=$libraryLoadFailed, init=$isInitialized, handle=$nativeHandle)")
             return null
         }
-        
+
         if (text.isBlank()) return ""
-        
+
         return try {
             Log.d(TAG, "Translating: $text")
-            val result = translate(text)
+            val result = translateWithInstance(nativeHandle, text)
             if (result != null) {
                 Log.d(TAG, "Translation: $result")
             } else {
@@ -314,23 +326,24 @@ object HelsinkiONNXKV {
             null
         }
     }
-    
+
     fun translateSafe(text: String): String {
         return translateText(text) ?: ""
     }
-    
+
     fun isReady(): Boolean {
-        // 简化：只检查标志，不调用 native 方法
-        return !libraryLoadFailed && isInitialized
+        return !libraryLoadFailed && isInitialized && nativeHandle != 0L &&
+                isInstanceInitialized(nativeHandle)
     }
-    
+
     fun release() {
-        if (libraryLoadFailed || !isInitialized) return
-        
+        if (libraryLoadFailed || nativeHandle == 0L) return
+
         try {
-            releaseSession()
+            destroyInstance(nativeHandle)
+            nativeHandle = 0
             isInitialized = false
-            Log.i(TAG, "Helsinki translator released")
+            Log.i(TAG, "Helsinki translator instance released")
         } catch (e: Exception) {
             Log.e(TAG, "Error releasing", e)
         }
