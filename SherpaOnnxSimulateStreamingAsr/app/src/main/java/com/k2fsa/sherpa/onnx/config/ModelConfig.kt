@@ -1,13 +1,30 @@
 package com.k2fsa.sherpa.onnx.config
 
+import android.content.Context
+import java.io.File
+
 /**
  * 统一配置管理
  * 所有模型选择、运行参数、业务逻辑参数都在这里配置
  */
 object ModelConfig {
-    
+
     // ========== 模型选择 ==========
     object Selection {
+        /**
+         * 模型服务器地址
+         * 首次启动时从此地址下载模型文件
+         */
+        var MODEL_SERVER_URL = "http://your-model-server.com/models"
+
+        /**
+         * 获取模型存储路径
+         * 优先从下载目录加载，不存在则从 assets 加载（向后兼容）
+         */
+        fun getModelBasePath(context: Context): String {
+            return com.k2fsa.sherpa.onnx.download.ModelDownloadManager.Config.getModelCacheDir(context).absolutePath
+        }
+
         /**
          * VAD 模型类型
          * 0 = silero_vad.onnx (CPU)

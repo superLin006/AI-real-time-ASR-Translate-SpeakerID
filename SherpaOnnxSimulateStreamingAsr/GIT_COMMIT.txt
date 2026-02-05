@@ -1,0 +1,28 @@
+feat: 实现模型按需下载和外部存储加载机制（2026-2-5）
+
+主要变更：
+- 移除 APK 内置模型，改为外部存储动态加载
+- 实现按需下载：根据配置只下载所需模型
+- 优化应用体积：减少 ~1.4GB（模型不再打包）
+- 规范化目录结构：ASR/、VAD/、Speaker/、Translation/
+- 新增 push_models.sh 脚本：支持 ADB 手动推送模型调试
+- 修复翻译器初始化时 context 参数缺失问题
+- 修复文件权限导致的模型加载失败问题
+
+技术细节：
+- 新增 ModelDownloadManager.kt：实现按需下载逻辑
+- 新增 ModelInitializer.kt：启动时检查和下载模型
+- 简化 ModelConfig.kt：移除多模式支持，只保留下载模式
+- 重构 Helsinki.kt：移除 assets 加载路径
+- 修复 SimulateStreamingAsr.kt：正确传递 context 参数
+- 修复 MainActivity.kt：Toast 线程安全问题
+
+文档更新：
+- 新增 MODEL_DOWNLOAD_GUIDE.md：完整的模型下载和配置指南
+- 整合原有的 MODEL_DOWNLOAD_CONFIG.md 和 ON_DEMAND_DOWNLOAD.md
+
+开发调试：
+- push_models.sh：从 assets 推送模型到设备，自动修复权限
+- test_parallel_loading.sh：监控并行加载性能
+
+Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>

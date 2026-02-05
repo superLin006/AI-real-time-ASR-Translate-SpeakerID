@@ -26,6 +26,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.core.app.ActivityCompat
+import androidx.lifecycle.lifecycleScope
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
@@ -33,9 +34,11 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.k2fsa.sherpa.onnx.config.ModelConfig
+import com.k2fsa.sherpa.onnx.download.ModelInitializer
 import com.k2fsa.sherpa.onnx.simulate.streaming.asr.screens.HelpScreen
 import com.k2fsa.sherpa.onnx.simulate.streaming.asr.screens.HomeScreen
 import com.k2fsa.sherpa.onnx.simulate.streaming.asr.ui.theme.SimulateStreamingAsrTheme
+import kotlinx.coroutines.launch
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -154,77 +157,81 @@ class MainActivity : ComponentActivity() {
     }
     
     /**
-     * 统一初始化所有模型
+     * 统一初始化所有模型（支持多种加载方式）
      */
     private fun initializeAllModels() {
-        Log.i(TAG, "========================================")
-        Log.i(TAG, "Initializing all components...")
-        Log.i(TAG, "========================================")
-        
-        try {
-            // 1. 初始化ASR识别器（MTK 模型使用外部路径）
-            SimulateStreamingAsr.initOfflineRecognizer(
-                assetManager = this.assets,
-                application = this.application,
-                externalModelBasePath = mtkModelPath  // MTK 模型复制后的路径
-            )
-            
-            // 2. 初始化VAD
-            SimulateStreamingAsr.initVad(this.assets)
-            
-            // 3. 初始化说话人识别（如果启用）
-            if (ModelConfig.Features.ENABLE_SPEAKER_ID) {
-                SimulateStreamingAsr.initSpeakerIdentification(this.assets)
-            } else {
-                Log.i(TAG, "Speaker ID disabled by config")
-            }
-            
-            // 4. 初始化翻译器（如果启用）
-            if (ModelConfig.Features.ENABLE_TRANSLATION) {
-                try {
-                    Log.i(TAG, "Initializing Helsinki translator...")
-
-                    SimulateStreamingAsr.initTranslator(
-                        assetManager = this.assets,
-                        cacheDir = this.cacheDir,
-                        maxCacheSize = ModelConfig.Cache.MAX_TRANSLATION_CACHE_SIZE
-                    )
-
-                    if (SimulateStreamingAsr.isTranslatorReady()) {
-                        val mode = ModelConfig.Selection.TRANSLATION_MODE
-                        val modeText = when (mode) {
-                            "BIDIRECTIONAL" -> {
-                                val lang1 = "${ModelConfig.Selection.SOURCE_LANG1}↔${ModelConfig.Selection.TARGET_LANG1}"
-                                val lang2 = "${ModelConfig.Selection.SOURCE_LANG2}↔${ModelConfig.Selection.TARGET_LANG2}"
-                                "Bidirectional ($lang1, $lang2)"
-                            }
-                            "UNIDIRECTIONAL" -> {
-                                val modelDir = ModelConfig.Selection.TRANSLATION_MODEL_DIR.substringAfterLast("/")
-                                "Unidirectional ($modelDir)"
-                            }
-                            else -> mode
-                        }
-                        Log.i(TAG, "Helsinki translator initialized successfully ✓")
-                        Toast.makeText(this, "Translation: $modeText", Toast.LENGTH_SHORT).show()
-                    } else {
-                        Log.w(TAG, "Helsinki translator initialization failed")
-                        Toast.makeText(this, "Translation unavailable", Toast.LENGTH_LONG).show()
+        lifecycleScope.launch {
+            // 第一步：确保模型已准备好（如果使用 download 模式，会在这里下载）
+            val modelsReady = ModelInitializer.ensureModelsReady(
+                context = this@MainActivity,
+                onProgress = { current, total, fileName ->
+                    Log.i(TAG, "Downloading model $current/$total: $fileName")
+                    // Toast 必须在主线程调用
+                    runOnUiThread {
+                        Toast.makeText(
+                            this@MainActivity,
+                            "Downloading: $fileName ($current/$total)",
+                            Toast.LENGTH_SHORT
+                        ).show()
                     }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to initialize translator", e)
-                    Toast.makeText(this, "Translation error: ${e.message}", Toast.LENGTH_LONG).show()
                 }
-            } else {
-                Log.i(TAG, "Translation disabled by config")
+            )
+
+            if (!modelsReady) {
+                Log.e(TAG, "Failed to prepare models")
+                runOnUiThread {
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Failed to download models. Please check your network connection.",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+                return@launch
             }
-            
-            Log.i(TAG, "========================================")
-            Log.i(TAG, "All components initialization completed")
-            Log.i(TAG, "========================================")
-            
-        } catch (e: Exception) {
-            Log.e(TAG, "Initialization error", e)
-            Toast.makeText(this, "Initialization error: ${e.message}", Toast.LENGTH_LONG).show()
+
+            // 第二步：使用全模块并行初始化加载模型
+            try {
+                Log.i(TAG, "Starting model initialization...")
+
+                SimulateStreamingAsr.initAllModelsParallel(
+                    assetManager = this@MainActivity.assets,
+                    application = this@MainActivity.application,
+                    cacheDir = this@MainActivity.cacheDir,
+                    externalModelBasePath = mtkModelPath,
+                    maxCacheSize = ModelConfig.Cache.MAX_TRANSLATION_CACHE_SIZE
+                )
+
+                // 初始化后的状态检查和提示
+                if (SimulateStreamingAsr.isTranslatorReady() && ModelConfig.Features.ENABLE_TRANSLATION) {
+                    val mode = ModelConfig.Selection.TRANSLATION_MODE
+                    val modeText = when (mode) {
+                        "BIDIRECTIONAL" -> {
+                            val lang1 = "${ModelConfig.Selection.SOURCE_LANG1}↔${ModelConfig.Selection.TARGET_LANG1}"
+                            val lang2 = "${ModelConfig.Selection.SOURCE_LANG2}↔${ModelConfig.Selection.TARGET_LANG2}"
+                            "Bidirectional ($lang1, $lang2)"
+                        }
+                        "UNIDIRECTIONAL" -> {
+                            val modelDir = ModelConfig.Selection.TRANSLATION_MODEL_DIR.substringAfterLast("/")
+                            "Unidirectional ($modelDir)"
+                        }
+                        else -> mode
+                    }
+                    Toast.makeText(this@MainActivity, "Translation: $modeText", Toast.LENGTH_SHORT).show()
+                } else if (ModelConfig.Features.ENABLE_TRANSLATION) {
+                    Toast.makeText(this@MainActivity, "Translation unavailable", Toast.LENGTH_LONG).show()
+                }
+
+                Toast.makeText(this@MainActivity, "✓ Models initialized successfully!", Toast.LENGTH_SHORT).show()
+                Log.i(TAG, "Model initialization completed successfully")
+
+            } catch (e: Exception) {
+                Log.e(TAG, "Initialization error", e)
+                Toast.makeText(
+                    this@MainActivity,
+                    "Initialization error: ${e.message}",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
         }
     }
 

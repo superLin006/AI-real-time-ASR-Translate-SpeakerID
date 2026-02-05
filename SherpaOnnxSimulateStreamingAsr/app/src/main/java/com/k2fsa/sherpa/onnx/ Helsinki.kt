@@ -95,7 +95,8 @@ class HelsinkiONNXKV {
         cacheDir: File,
         modelDir: String = "helsinki-translation/en-zh",
         verbose: Boolean = true,
-        maxCacheSize: Long = 500 * 1024 * 1024  // 默认500MB限制
+        maxCacheSize: Long = 500 * 1024 * 1024,  // 默认500MB限制
+        context: android.content.Context? = null  // 用于 download 模式
     ): Boolean {
         if (libraryLoadFailed) {
             Log.e(TAG, "Cannot initialize: library failed to load")
@@ -107,201 +108,17 @@ class HelsinkiONNXKV {
             return true
         }
 
-        if (assetManager == null) {
-            Log.e(TAG, "AssetManager is null")
-            return false
-        }
-
         Log.i(TAG, "========================================")
         Log.i(TAG, "Initializing Helsinki Translator Instance")
         Log.i(TAG, "========================================")
-        Log.i(TAG, "Assets path: $modelDir")
-        Log.i(TAG, "Cache dir: ${cacheDir.absolutePath}")
 
-        try {
-            // 创建 C++ 实例
-            nativeHandle = createInstance()
-            if (nativeHandle == 0L) {
-                Log.e(TAG, "Failed to create native instance")
-                return false
-            }
-            Log.i(TAG, "Native instance created: 0x${nativeHandle.toString(16)}")
-
-            // 准备模型文件
-            val helsinkiCacheRoot = File(cacheDir, "helsinki-models")
-            val tempDir = File(helsinkiCacheRoot, modelDir.replace("/", "_"))
-
-            if (!tempDir.exists()) {
-                if (tempDir.mkdirs()) {
-                    Log.i(TAG, "Created temp directory: ${tempDir.absolutePath}")
-                } else {
-                    Log.e(TAG, "Failed to create temp directory")
-                    return false
-                }
-            }
-
-            // 更新访问时间（用于LRU）
-            try {
-                File(tempDir, ".last_access").writeText(System.currentTimeMillis().toString())
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to update access time: ${e.message}")
-            }
-
-            // LRU缓存清理逻辑（同原版）
-            try {
-                if (helsinkiCacheRoot.exists()) {
-                    val allDirs = helsinkiCacheRoot.listFiles()?.filter {
-                        it.isDirectory && !it.name.startsWith(".")
-                    } ?: emptyList()
-
-                    val totalSize = allDirs.sumOf { dir ->
-                        dir.walkTopDown()
-                            .filter { it.isFile && !it.name.startsWith(".") }
-                            .map { it.length() }
-                            .sum()
-                    }
-
-                    Log.d(TAG, "Current cache size: ${totalSize / 1024 / 1024}MB (limit: ${maxCacheSize / 1024 / 1024}MB)")
-
-                    if (totalSize > maxCacheSize) {
-                        Log.w(TAG, "Cache size exceeds limit, starting LRU cleanup...")
-
-                        val currentDirName = modelDir.replace("/", "_")
-
-                        val sortedDirs = allDirs.sortedBy { dir ->
-                            val accessFile = File(dir, ".last_access")
-                            if (accessFile.exists()) {
-                                try {
-                                    accessFile.readText().toLongOrNull() ?: 0L
-                                } catch (e: Exception) {
-                                    0L
-                                }
-                            } else {
-                                0L
-                            }
-                        }
-
-                        var currentSize = totalSize
-                        for (dir in sortedDirs) {
-                            if (dir.name == currentDirName) {
-                                continue
-                            }
-
-                            val dirSize = dir.walkTopDown()
-                                .filter { it.isFile }
-                                .map { it.length() }
-                                .sum()
-
-                            Log.i(TAG, "Removing old cache: ${dir.name} (${dirSize / 1024 / 1024}MB)")
-                            dir.deleteRecursively()
-                            currentSize -= dirSize
-
-                            if (currentSize <= maxCacheSize * 0.8) {
-                                Log.i(TAG, "Cache cleanup completed, new size: ${currentSize / 1024 / 1024}MB")
-                                break
-                            }
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Error during cache cleanup: ${e.message}", e)
-            }
-
-            val fileMap = linkedMapOf(
-                "encoder_model.onnx" to "encoder",
-                "decoder_model.onnx" to "decoder",
-                "decoder_with_past_model.onnx" to "decoder_with_past",
-                "source.spm" to "source_spm",
-                "target.spm" to "target_spm",
-                "vocab.txt" to "vocab"
-            )
-
-            val filePaths = mutableMapOf<String, String>()
-
-            Log.i(TAG, "Preparing model files...")
-
-            for ((filename, key) in fileMap) {
-                val assetPath = "$modelDir/$filename"
-                val destFile = File(tempDir, filename)
-
-                var needCopy = !destFile.exists()
-
-                if (!needCopy) {
-                    try {
-                        val assetFd = assetManager.openFd(assetPath)
-                        val assetSize = assetFd.length
-                        assetFd.close()
-                        val cachedSize = destFile.length()
-
-                        if (assetSize != cachedSize) {
-                            Log.w(TAG, "  $filename: size mismatch (cached=$cachedSize, asset=$assetSize)")
-                            needCopy = true
-                        } else {
-                            Log.d(TAG, "  $filename: using cached ($cachedSize bytes)")
-                        }
-                    } catch (e: Exception) {
-                        Log.w(TAG, "  $filename: cannot verify, will recopy")
-                        needCopy = true
-                    }
-                }
-
-                if (needCopy) {
-                    Log.i(TAG, "  Copying: $filename")
-                    if (!copyAssetToFile(assetManager, assetPath, destFile)) {
-                        Log.e(TAG, "✗ Failed to copy $filename")
-                        return false
-                    }
-                }
-
-                if (!destFile.exists() || destFile.length() == 0L) {
-                    Log.e(TAG, "✗ Invalid file: ${destFile.absolutePath}")
-                    return false
-                }
-
-                filePaths[key] = destFile.absolutePath
-            }
-
-            Log.i(TAG, "Model files ready:")
-            filePaths.forEach { (key, path) ->
-                val file = File(path)
-                Log.i(TAG, "  $key: ${file.name} (${file.length()} bytes)")
-            }
-
-            Log.i(TAG, "Calling native initialization...")
-
-            val ret = initInstance(
-                handle = nativeHandle,
-                encoderPath = filePaths["encoder"]!!,
-                decoderPath = filePaths["decoder"]!!,
-                decoderWithPastPath = filePaths["decoder_with_past"]!!,
-                sourceSpm = filePaths["source_spm"]!!,
-                targetSpm = filePaths["target_spm"]!!,
-                vocabTxt = filePaths["vocab"]!!,
-                verbose = verbose
-            )
-
-            isInitialized = (ret == 0)
-
-            Log.i(TAG, "========================================")
-            if (isInitialized) {
-                Log.i(TAG, "✓ Helsinki translator instance initialized successfully!")
-                try {
-                    Log.i(TAG, "API Version: ${getApiVersionMulti()}")
-                } catch (e: Exception) {
-                    Log.w(TAG, "Cannot get API version: ${e.message}")
-                }
-            } else {
-                Log.e(TAG, "✗ Initialization failed with code: $ret")
-            }
-            Log.i(TAG, "========================================")
-
-            return isInitialized
-
-        } catch (e: Exception) {
-            Log.e(TAG, "Exception during initialization", e)
-            Log.e(TAG, "========================================")
+        // 🔥 从下载目录加载（模型应该已通过 ModelInitializer 下载）
+        if (context == null) {
+            Log.e(TAG, "Context is required for model loading")
             return false
         }
+
+        return initFromDownloadedPath(modelDir, context, cacheDir, verbose)
     }
 
     fun translateText(text: String): String? {
@@ -334,6 +151,110 @@ class HelsinkiONNXKV {
     fun isReady(): Boolean {
         return !libraryLoadFailed && isInitialized && nativeHandle != 0L &&
                 isInstanceInitialized(nativeHandle)
+    }
+
+    /**
+     * 从 APK assets 加载模型（包含在安装包中）
+     */
+    private fun initFromDownloadedPath(
+        modelDir: String,
+        context: android.content.Context? = null,
+        cacheDir: File? = null,
+        verbose: Boolean
+    ): Boolean {
+        Log.i(TAG, "[Downloaded Model Mode]")
+        Log.i(TAG, "Model directory: $modelDir")
+
+        try {
+            nativeHandle = createInstance()
+            if (nativeHandle == 0L) {
+                Log.e(TAG, "Failed to create native instance")
+                return false
+            }
+            Log.i(TAG, "Native instance created: 0x${nativeHandle.toString(16)}")
+
+            if (context == null) {
+                Log.e(TAG, "Context is required for download mode")
+                return false
+            }
+
+            // 将 helsinki-translation/zh-en 转换为 Translation/zh-en（规范化目录结构）
+            val dirName = modelDir.replace("helsinki-translation/", "Translation/")
+
+            val modelCacheDir = com.k2fsa.sherpa.onnx.download.ModelDownloadManager.Config.getModelCacheDir(context)
+            val downloadedDir = File(modelCacheDir, dirName)
+
+            if (!downloadedDir.exists()) {
+                Log.e(TAG, "✗ Downloaded model directory not found: ${downloadedDir.absolutePath}")
+                Log.e(TAG, "  Models need to be downloaded via ModelDownloadManager first")
+                return false
+            }
+
+            Log.i(TAG, "Downloaded model directory: ${downloadedDir.absolutePath}")
+
+            val fileMap = linkedMapOf(
+                "encoder_model.onnx" to "encoder",
+                "decoder_model.onnx" to "decoder",
+                "decoder_with_past_model.onnx" to "decoder_with_past",
+                "source.spm" to "source_spm",
+                "target.spm" to "target_spm",
+                "vocab.txt" to "vocab"
+            )
+
+            val filePaths = mutableMapOf<String, String>()
+
+            Log.i(TAG, "Verifying model files...")
+            for ((filename, key) in fileMap) {
+                val file = File(downloadedDir, filename)
+
+                if (!file.exists()) {
+                    Log.e(TAG, "✗ File not found: ${file.absolutePath}")
+                    return false
+                }
+
+                if (file.length() == 0L) {
+                    Log.e(TAG, "✗ Invalid file (empty): ${file.absolutePath}")
+                    return false
+                }
+
+                filePaths[key] = file.absolutePath
+                Log.i(TAG, "  ✓ $key: ${file.name} (${file.length()} bytes)")
+            }
+
+            Log.i(TAG, "Calling native initialization...")
+            val ret = initInstance(
+                handle = nativeHandle,
+                encoderPath = filePaths["encoder"]!!,
+                decoderPath = filePaths["decoder"]!!,
+                decoderWithPastPath = filePaths["decoder_with_past"]!!,
+                sourceSpm = filePaths["source_spm"]!!,
+                targetSpm = filePaths["target_spm"]!!,
+                vocabTxt = filePaths["vocab"]!!,
+                verbose = verbose
+            )
+
+            isInitialized = (ret == 0)
+
+            Log.i(TAG, "========================================")
+            if (isInitialized) {
+                Log.i(TAG, "✓ Helsinki translator instance initialized successfully from downloaded path!")
+                try {
+                    Log.i(TAG, "API Version: ${getApiVersionMulti()}")
+                } catch (e: Exception) {
+                    Log.w(TAG, "Cannot get API version: ${e.message}")
+                }
+            } else {
+                Log.e(TAG, "✗ Initialization failed with code: $ret")
+            }
+            Log.i(TAG, "========================================")
+
+            return isInitialized
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Exception during initialization from downloaded path", e)
+            Log.e(TAG, "========================================")
+            return false
+        }
     }
 
     fun release() {
