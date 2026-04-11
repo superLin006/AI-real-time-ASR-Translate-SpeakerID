@@ -63,31 +63,38 @@ cd AI-real-time-ASR-Translate-SpeakerID
 
 #### 2️⃣ 配置模型和资源文件
 
-**⚠️ 重要：由于模型文件较大，未包含在 Git 仓库中，请按以下说明下载并放置。**
+**⚠️ 重要：模型文件较大，未包含在 Git 仓库中。应用采用按需下载机制，首次启动时自动从服务器下载。**
 
-详细的模型下载和配置说明请查看：[📦 MODELS.md](./MODELS.md)
+详细的模型下载和配置说明请查看：[📦 MODEL_DOWNLOAD_GUIDE.md](./SherpaOnnxSimulateStreamingAsr/MODEL_DOWNLOAD_GUIDE.md)
 
 ##### 快速摘要：
 
-**所需模型文件：**
+**运行时模型存储路径（自动下载到设备）：**
 
 ```
-SherpaOnnxSimulateStreamingAsr/app/src/main/assets/
-├── silero_vad.onnx                    # VAD 模型
-├── 3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx  # 说话人识别
-├── sense-voice-rknn/
-│   ├── model-10-seconds.rknn         # ASR 模型（RKNN 格式）
-│   └── tokens.txt                    # 词表
-└── helsinki-translation/zh-en/        # 翻译模型（中→英）
-    ├── encoder_model.onnx
-    ├── decoder_model.onnx
-    ├── decoder_with_past_model.onnx
-    ├── source.spm
-    ├── target.spm
-    └── vocab.txt
+/storage/emulated/0/Android/data/com.k2fsa.sherpa.onnx.simulate.streaming.asr/files/models/
+├── ASR/
+│   └── sense-voice-rknn/
+│       ├── model-10-seconds.rknn    # ASR 模型（RKNN 格式，473MB）
+│       └── tokens.txt               # 词表（308KB）
+├── VAD/
+│   └── silero_vad.onnx              # VAD 模型（629KB）
+├── Speaker/
+│   └── 3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx  # 说话人识别（27MB）
+└── Translation/
+    ├── zh-en/                        # 中→英翻译模型（237MB）
+    └── en-zh/                        # 英→中翻译模型（237MB）
 ```
 
-**所需原生库文件：**
+**配置模型服务器**（编辑 `ModelConfig.kt`）：
+
+```kotlin
+object Selection {
+    var MODEL_SERVER_URL = "http://your-model-server.com/models"
+}
+```
+
+**所需原生库文件（需手动放置）：**
 
 ```
 SherpaOnnxSimulateStreamingAsr/app/src/main/jniLibs/arm64-v8a/
@@ -97,8 +104,6 @@ SherpaOnnxSimulateStreamingAsr/app/src/main/jniLibs/arm64-v8a/
 ├── librknnrt.so                      # RKNN Runtime
 └── librga.so                         # RGA 图形库
 ```
-
-**占位符保留**：目录结构已保留，放置文件后即可编译。
 
 #### 3️⃣ 构建项目
 
@@ -222,10 +227,19 @@ SpeechPipeline.feedAudio(samples)
 ```kotlin
 object ModelConfig {
     object Selection {
+        var MODEL_SERVER_URL = "http://your-model-server.com/models"  // 模型下载服务器
+
         const val VAD_MODEL_TYPE = 0      // 0=Silero CPU, 1=TenVAD, 2=Silero RKNN
         const val ASR_MODEL_TYPE = 100    // 100=SenseVoice-RKNN, 101=Whisper-RKNN
-        const val SPEAKER_MODEL = "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx"
-        const val TRANSLATION_MODEL_DIR = "helsinki-translation/zh-en"
+
+        // 翻译模式：双向翻译（按ASR语言自动选方向）
+        const val TRANSLATION_MODE = "BIDIRECTIONAL"  // 或 "UNIDIRECTIONAL"
+        const val SOURCE_LANG1 = "en"    // 双向模式：方向1 源语言
+        const val TARGET_LANG1 = "zh"    // 双向模式：方向1 目标语言
+        const val SOURCE_LANG2 = "zh"    // 双向模式：方向2 源语言
+        const val TARGET_LANG2 = "en"    // 双向模式：方向2 目标语言
+
+        // 单向模式：const val TRANSLATION_MODEL_DIR = "helsinki-translation/ko-en"
     }
 
     object Pipeline {
@@ -244,11 +258,14 @@ object ModelConfig {
 
 ### 添加新模型
 
-1. 将模型文件放入 `app/src/main/assets/[model-name]/`
-2. 创建 Kotlin 封装类（参考 `OfflineRecognizer.kt`）
-3. 在 `ModelConfig.kt` 中添加配置
-4. 在 `MainActivity.initializeAllModels()` 中初始化
-5. 在 `SpeechPipeline.kt` 中集成处理逻辑
+1. 在服务器上添加模型文件（按 `ASR/`, `VAD/`, `Speaker/`, `Translation/` 目录结构）
+2. 在 `ModelDownloadManager.kt` 的 `getRequiredModels()` 中注册新模型的路径和大小
+3. 创建 Kotlin 封装类（参考 `OfflineRecognizer.kt`）
+4. 在 `ModelConfig.kt` 中添加配置
+5. 在 `MainActivity.initializeAllModels()` 中初始化
+6. 在 `SpeechPipeline.kt` 中集成处理逻辑
+
+详见：[MODEL_DOWNLOAD_GUIDE.md - 添加新模型](./SherpaOnnxSimulateStreamingAsr/MODEL_DOWNLOAD_GUIDE.md#添加新模型)
 
 ### 性能调优
 
@@ -291,18 +308,16 @@ AI-real-time-ASR-Translate-SpeakerID/
 │   │   │   │       ├── SpeakerEmbeddingExtractor.kt
 │   │   │   │       ├── SpeakerEmbeddingManager.kt
 │   │   │   │       └── Helsinki.kt
-│   │   │   ├── assets/                      # 模型文件目录（见 MODELS.md）
-│   │   │   │   ├── [*.onnx, *.rknn]        # 占位符，需下载
-│   │   │   │   └── helsinki-translation/
-│   │   │   └── jniLibs/arm64-v8a/          # 原生库（见 MODELS.md）
-│   │   │       └── [*.so]                  # 占位符，需下载
+│   │   │   ├── assets/                      # 无模型文件（运行时自动下载）
+│   │   │   └── jniLibs/arm64-v8a/          # 原生库（需手动放置）
+│   │   │       └── [*.so]                  # 见安装步骤2
 │   │   └── build.gradle.kts                # 应用级构建配置
 │   ├── build.gradle.kts                    # 项目级构建配置
-│   └── gradle.properties                   # Gradle 配置
+│   ├── gradle.properties                   # Gradle 配置
+│   └── MODEL_DOWNLOAD_GUIDE.md             # 模型下载配置指南
 ├── picture/
 │   └── 算法架构设计.png                     # 架构图
 ├── CLAUDE.md                               # Claude Code 开发指南
-├── MODELS.md                               # 模型资源下载说明
 └── README.md                               # 本文件
 ```
 
@@ -335,7 +350,7 @@ AI-real-time-ASR-Translate-SpeakerID/
 
 **开发前请阅读：**
 - [CLAUDE.md](./CLAUDE.md) - 代码库架构和开发指南
-- [MODELS.md](./MODELS.md) - 模型资源配置说明
+- [MODEL_DOWNLOAD_GUIDE.md](./SherpaOnnxSimulateStreamingAsr/MODEL_DOWNLOAD_GUIDE.md) - 模型下载配置说明
 
 ---
 
