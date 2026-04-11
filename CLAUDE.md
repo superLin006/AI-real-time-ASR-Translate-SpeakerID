@@ -88,9 +88,10 @@ AudioRecorder → VAD → ASR → [Speaker ID + Translation]
 
 #### `SimulateStreamingAsr.kt` (Singleton)
 Global model lifecycle manager:
-- Initializes all AI models on app startup
+- Initializes all AI models on app startup via `initAllModelsParallel()` (4 modules load concurrently, ~10s vs 23s serial)
 - Provides thread-safe access to model instances
 - Methods: `extractEmbedding()`, `translateText()`, `identifyOrRegisterSpeaker()`
+- Supports bidirectional translation via `translatorMap` (source language → translator)
 - Releases resources via `releaseAll()`
 
 #### `SpeechPipeline.kt`
@@ -112,7 +113,7 @@ Centralized configuration with 5 sub-objects:
 #### `MainActivity.kt`
 App entry point:
 - Handles RECORD_AUDIO permission
-- Initializes all models via `initializeAllModels()`
+- Initializes models in two steps: `ModelInitializer.ensureModelsReady()` (download if missing) → `SimulateStreamingAsr.initAllModelsParallel()` (load all 4 modules in parallel)
 - Sets up Compose navigation
 
 #### `HomeScreen` (Home.kt)
@@ -125,15 +126,22 @@ Main UI with recording controls and results display:
 
 ### Model Files Location
 
-All models are in `app/src/main/assets/`:
-- `silero_vad.onnx` - Voice Activity Detection
-- `3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx` - Speaker identification
-- `helsinki-translation/zh-en/` - Translation models (Chinese to English)
-  - `encoder_model.onnx`
-  - `decoder_model.onnx`
-  - `decoder_with_past_model.onnx`
-  - `source.spm`, `target.spm`, `vocab.txt`
-- `sense-voice-rknn/model-10-seconds.rknn` - ASR model (RKNN format for NPU)
+Models are **not bundled in assets**. They are downloaded at runtime to external storage via `ModelDownloadManager`:
+
+```
+/storage/emulated/0/Android/data/com.k2fsa.sherpa.onnx.simulate.streaming.asr/files/models/
+├── ASR/sense-voice-rknn/
+│   ├── model-10-seconds.rknn   (473MB, RKNN NPU format)
+│   └── tokens.txt
+├── VAD/silero_vad.onnx          (629KB)
+├── Speaker/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx  (27MB)
+└── Translation/
+    ├── zh-en/  (encoder, decoder, decoder_with_past, source.spm, target.spm, vocab.txt)
+    └── en-zh/  (same structure)
+```
+
+Model server URL is configured in `ModelConfig.Selection.MODEL_SERVER_URL`.
+See `SherpaOnnxSimulateStreamingAsr/MODEL_DOWNLOAD_GUIDE.md` for full details.
 
 ### JNI Native Libraries
 
@@ -148,12 +156,12 @@ Located in `app/src/main/jniLibs/arm64-v8a/`:
 
 ### Adding a New Model
 
-1. Place model files in `app/src/main/assets/[model-name]/`
-2. Update `androidResources.noCompress` in `app/build.gradle.kts` if using new file extension
+1. Add model files to the model server under the appropriate subdirectory (`ASR/`, `VAD/`, `Speaker/`, or `Translation/`)
+2. Register the model in `ModelDownloadManager.Config.getRequiredModels()` with correct `relativePath` and `size` (bytes — used for existence check)
 3. Create Kotlin wrapper class (see `OfflineRecognizer.kt` as reference)
 4. Add configuration to `ModelConfig.kt` (Selection section)
-5. Initialize in `MainActivity.initializeAllModels()`
-6. Add to `SimulateStreamingAsr` singleton if shared globally
+5. Add load path logic in `SimulateStreamingAsr` (use `ModelConfig.Selection.getModelBasePath(application)` as the base directory)
+6. Add the init call to `initAllModelsParallel()` as a new `async(Dispatchers.IO)` job
 7. Integrate into `SpeechPipeline` processing flow if needed
 
 ### Modifying Pipeline Logic
@@ -174,10 +182,13 @@ Key file: `SpeechPipeline.processAudioStream()` (lines 69-223)
 ### Changing Model Selection
 
 Edit `ModelConfig.Selection`:
+- `MODEL_SERVER_URL`: Remote server to download models from (first-time setup)
 - `VAD_MODEL_TYPE`: 0=Silero CPU, 1=TenVAD, 2=Silero RKNN
 - `ASR_MODEL_TYPE`: 100=SenseVoice-RKNN, 101=Whisper-RKNN (see `OfflineRecognizer.getOfflineModelConfig()` for full list)
-- `SPEAKER_MODEL`: Path to speaker ID model in assets
-- `TRANSLATION_MODEL_DIR`: Translation model directory in assets
+- `SPEAKER_MODEL`: Filename of speaker ID model (resolved under `Speaker/` in download dir)
+- `TRANSLATION_MODE`: `"BIDIRECTIONAL"` (auto-selects by detected language) or `"UNIDIRECTIONAL"` (fixed model)
+- For `BIDIRECTIONAL`: set `SOURCE_LANG1/TARGET_LANG1` and `SOURCE_LANG2/TARGET_LANG2`
+- For `UNIDIRECTIONAL`: set `TRANSLATION_MODEL_DIR` (e.g. `"helsinki-translation/ko-en"`)
 
 ### Performance Tuning
 
@@ -257,6 +268,9 @@ app/src/main/java/com/k2fsa/sherpa/onnx/
 │   └── AudioRecorder.kt             # Audio capture wrapper
 ├── config/
 │   └── ModelConfig.kt               # Centralized configuration
+├── download/
+│   ├── ModelDownloadManager.kt      # Download + existence check logic
+│   └── ModelInitializer.kt          # ensureModelsReady() entry point
 └── [Model wrappers]
     ├── OfflineRecognizer.kt         # ASR wrapper
     ├── Vad.kt                       # VAD wrapper
