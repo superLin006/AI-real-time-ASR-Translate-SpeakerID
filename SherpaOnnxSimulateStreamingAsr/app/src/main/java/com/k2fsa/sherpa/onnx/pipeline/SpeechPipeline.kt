@@ -1,6 +1,7 @@
 package com.k2fsa.sherpa.onnx.pipeline
 
 import android.util.Log
+import java.util.concurrent.atomic.AtomicLong
 import com.k2fsa.sherpa.onnx.config.ModelConfig
 import com.k2fsa.sherpa.onnx.simulate.streaming.asr.SimulateStreamingAsr
 import com.k2fsa.sherpa.onnx.simulate.streaming.asr.TAG
@@ -14,20 +15,23 @@ import kotlinx.coroutines.channels.Channel
  */
 class SpeechPipeline(
     private val onIntermediateResult: (PipelineResult) -> Unit,  // 中间结果回调
-    private val onFinalResult: (PipelineResult) -> Unit,         // 最终结果回调  // 翻译更新回调 (索引, 译文)
-    private val onTranslationUpdate: (Int, String) -> Unit       
+    private val onFinalResult: (PipelineResult) -> Unit,         // 最终结果回调
+    private val onTranslationUpdate: (Long, String) -> Unit      // 翻译更新回调（结果 ID、译文）
 ) {
     private val samplesChannel = Channel<FloatArray>(capacity = Channel.UNLIMITED)
     private var processingJob: Job? = null
     private var isRunning = false
     
     // 翻译管理
-    private val translationJobs = mutableMapOf<Int, Job>()
+    private val translationJobs = mutableMapOf<Long, Job>()
     private val translationCache = mutableMapOf<String, String>()
     private var lastTranslationTime = 0L
     
     // 当前处理状态
-    private var currentResultIndex = -1
+    private var currentResultIndex = -1L
+    companion object {
+        private val nextResultId = AtomicLong(0)
+    }
     private var recordingStartTime = 0L
     
     /**
@@ -122,8 +126,11 @@ class SpeechPipeline(
                         val intermediateLang = extractLanguageCode(result.lang)
                         val targetLang = SimulateStreamingAsr.getTargetLanguage(intermediateLang)
 
+                        currentCoroutineContext().ensureActive()
+                        if (!added) currentResultIndex = nextResultId.getAndIncrement()
                         // 创建中间结果
                         val tempResult = PipelineResult(
+                            resultId = currentResultIndex,
                             timestamp = timestamp,
                             speakerName = "...",
                             originalText = lastText,
@@ -135,7 +142,6 @@ class SpeechPipeline(
 
                         // 🔥 关键：与原代码逻辑完全一致
                         if (!added) {
-                            currentResultIndex++
                             added = true
                             onIntermediateResult(tempResult)  // 新增中间结果
                         } else {
@@ -204,8 +210,11 @@ class SpeechPipeline(
                             val targetLang = SimulateStreamingAsr.getTargetLanguage(detectedLang)
                             Log.i(TAG, "Translation direction: $detectedLang → ${targetLang ?: "none"}")
 
+                            currentCoroutineContext().ensureActive()
+                            if (!added) currentResultIndex = nextResultId.getAndIncrement()
                             // 创建最终结果
                             val finalResult = PipelineResult(
+                                resultId = currentResultIndex,
                                 timestamp = timestamp,
                                 speakerName = speakerName,
                                 originalText = asrResult.text,
@@ -221,7 +230,6 @@ class SpeechPipeline(
                                 onFinalResult(finalResult)
                             } else {
                                 // 直接添加最终结果（没有中间结果的情况）
-                                currentResultIndex++
                                 onFinalResult(finalResult)
                             }
 
@@ -248,7 +256,7 @@ class SpeechPipeline(
      * 翻译逻辑（带防抖和缓存）
      * 支持配置化的翻译模式（双向/单向）
      */
-    private fun maybeTranslate(text: String, resultIndex: Int, isFinal: Boolean, detectedLang: String? = null) {
+    private fun maybeTranslate(text: String, resultIndex: Long, isFinal: Boolean, detectedLang: String? = null) {
         if (!SimulateStreamingAsr.isTranslatorReady()) return
 
         val now = System.currentTimeMillis()
@@ -311,6 +319,7 @@ class SpeechPipeline(
                     } else null
                 }
 
+                ensureActive()
                 // 更新翻译
                 if (translation != null) {
                     onTranslationUpdate(resultIndex, translation)
@@ -360,6 +369,7 @@ class SpeechPipeline(
  * Pipeline 输出结果
  */
 data class PipelineResult(
+    val resultId: Long,
     val timestamp: String,
     val speakerName: String,
     val originalText: String,

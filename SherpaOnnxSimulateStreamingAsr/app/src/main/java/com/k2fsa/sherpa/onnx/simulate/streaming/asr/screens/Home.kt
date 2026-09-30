@@ -35,6 +35,7 @@ private var speechPipeline: SpeechPipeline? = null
 
 // 带时间戳、说话人标签和翻译的结果数据类
 data class SpeakerResult(
+    val resultId: Long,
     val timestamp: String,
     val speakerName: String,
     val originalText: String,
@@ -57,6 +58,7 @@ fun HomeScreen() {
     val onIntermediateResult: (com.k2fsa.sherpa.onnx.pipeline.PipelineResult) -> Unit = { result ->
         coroutineScope.launch(Dispatchers.Main) {
             val displayResult = SpeakerResult(
+                resultId = result.resultId,
                 timestamp = result.timestamp,
                 speakerName = result.speakerName,
                 originalText = result.originalText,
@@ -64,13 +66,11 @@ fun HomeScreen() {
                 isFinal = result.isFinal
             )
             
-            // 🔥 与原代码逻辑完全一致
-            if (resultList.isEmpty() || resultList.last().isFinal) {
-                // 没有中间结果或上一个已经是最终结果，添加新的
+            val resultIndex = resultList.indexOfFirst { it.resultId == result.resultId }
+            if (resultIndex < 0) {
                 resultList.add(displayResult)
             } else {
-                // 更新最后一个中间结果
-                resultList[resultList.lastIndex] = displayResult
+                resultList[resultIndex] = displayResult
             }
             
             lazyColumnListState.animateScrollToItem(resultList.size - 1)
@@ -80,6 +80,7 @@ fun HomeScreen() {
     val onFinalResult: (com.k2fsa.sherpa.onnx.pipeline.PipelineResult) -> Unit = { result ->
         coroutineScope.launch(Dispatchers.Main) {
             val displayResult = SpeakerResult(
+                resultId = result.resultId,
                 timestamp = result.timestamp,
                 speakerName = result.speakerName,
                 originalText = result.originalText,
@@ -87,22 +88,20 @@ fun HomeScreen() {
                 isFinal = result.isFinal
             )
             
-            // 🔥 与原代码逻辑完全一致
-            if (resultList.isEmpty() || resultList.last().isFinal) {
-                // 直接添加（没有中间结果的情况）
+            val resultIndex = resultList.indexOfFirst { it.resultId == result.resultId }
+            if (resultIndex < 0) {
                 resultList.add(displayResult)
             } else {
-                // 更新最后一个中间结果为最终结果
-                resultList[resultList.lastIndex] = displayResult
+                resultList[resultIndex] = displayResult
             }
             
             lazyColumnListState.animateScrollToItem(resultList.size - 1)
         }
     }
     
-    val onTranslationUpdate: (Int, String) -> Unit = { resultIndex, translation ->
+    val onTranslationUpdate: (Long, String) -> Unit = { resultId, translation ->
         coroutineScope.launch(Dispatchers.Main) {
-            // 🔥 与原代码逻辑完全一致：直接更新指定索引的翻译
+            val resultIndex = resultList.indexOfFirst { it.resultId == resultId }
             if (resultIndex >= 0 && resultIndex < resultList.size) {
                 resultList[resultIndex] = resultList[resultIndex].copy(
                     translatedText = translation
